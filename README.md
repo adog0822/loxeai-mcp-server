@@ -2,7 +2,7 @@
 
 An MCP server for SOC 2 compliance work that runs entirely on your machine.
 
-It scans your Infrastructure-as-Code, maps findings to SOC 2 Trust Services Criteria, explains them in plain English, and drafts the documents an audit will ask for. No account. No signup. No network calls. Your files never leave the laptop.
+It scans your Infrastructure-as-Code, maps findings to SOC 2 Trust Services Criteria, explains them in plain English, and drafts the documents an audit will ask for. Your files never leave the laptop.
 
 ```bash
 claude mcp add loxeai -- npx -y @loxeai/mcp-server
@@ -12,9 +12,9 @@ claude mcp add loxeai -- npx -y @loxeai/mcp-server
 
 ## Why this exists
 
-Every compliance-automation platform surveyed converges on the same artifact: a dashboard of green checkmarks asserting things a viewer cannot verify. Auditors have noticed — some now refuse platform-reported data and require raw exports instead.
+Every compliance-automation platform surveyed converges on the same artifact: a dashboard of green checkmarks asserting things a viewer cannot verify. Auditors have noticed, some now refuse platform-reported data and require raw exports instead.
 
-This tool is built the other way around. It tells you what it *can't* prove as clearly as what it can:
+This tool  tells you what it *can't* prove as clearly as what it can:
 
 - **An IaC scan is the primary evidence source for 3 of the 33 SOC 2 Common Criteria.** It partially informs 8 more. The remaining 22 are out of reach of any infrastructure scan — they need documents, people, or live cloud state. The tool says this to your face rather than implying broader coverage.
 - **It never reports a criterion as satisfied.** The absence of a finding is not evidence of compliance, and that judgment belongs to a licensed CPA. A test asserts the string `"satisfied"` cannot appear in the OSCAL output.
