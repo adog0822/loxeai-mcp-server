@@ -1,0 +1,75 @@
+name: verify
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # The matrix exists because every claim in `engines` is currently unproven.
+  # Development happened on macOS + Node 25 only, while package.json advertises
+  # ">=20". Linux differs in two ways this package actually depends on: path
+  # case-sensitivity (the credential denylist compares path segments) and the
+  # availability of the scanner binaries.
+  verify:
+    name: verify (${{ matrix.os }}, node ${{ matrix.node }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Do not cancel the whole matrix on one failure -- when a break is
+      # platform-specific, the other cells are the diagnostic.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        node: ["20", "22", "24"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - run: npm ci
+
+      # Checkov is required: the live-scanner tests are the only place the real
+      # output shape is exercised, and that shape has already caused two silent
+      # under-reporting bugs. A run without it would pass while proving nothing.
+      - name: Install Checkov
+        run: pipx install checkov
+
+      - name: Confirm Checkov is on PATH
+        run: checkov --version
+
+      - name: Verify invariants
+        run: bash scripts/verify.sh
+
+  # Split from `verify` so a dependency advisory does not mask a real test
+  # failure, and so it runs once rather than six times.
+  audit:
+    name: supply chain
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+
+      # Only production dependencies gate the build. Dev-only advisories (vite,
+      # esbuild) are real but never reach a user: they are not in `files`, and
+      # `npm ci --omit=dev` on an installed copy does not fetch them.
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=high
+
+      - name: Report dev advisories (non-blocking)
+        run: npm audit || true
+
+      - name: Generate SBOM
+        run: npm sbom --sbom-format cyclonedx --omit=dev > sbom.cyclonedx.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.cyclonedx.json

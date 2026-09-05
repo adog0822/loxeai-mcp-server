@@ -1,0 +1,48 @@
+{
+  "name": "@loxeai/mcp-server",
+  "version": "0.1.0",
+  "description": "MCP server for compliance automation. Scans Infrastructure-as-Code locally and maps findings to SOC 2 Trust Services Criteria. File contents never leave the machine.",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "loxeai-mcp-server": "./dist/index.js"
+  },
+  "main": "./dist/index.js",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/index.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "inspect": "npm run build && npx @modelcontextprotocol/inspector node dist/index.js",
+    "verify": "bash scripts/verify.sh"
+  },
+  "keywords": [
+    "mcp",
+    "modelcontextprotocol",
+    "soc2",
+    "compliance",
+    "grc",
+    "terraform",
+    "iac",
+    "checkov",
+    "trivy"
+  ],
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  }
+}

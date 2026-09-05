@@ -1,0 +1,625 @@
+/**
+ * Trust page generation.
+ *
+ * ---------------------------------------------------------------------------
+ * WHY THE VOCABULARY IN THIS FILE IS SO CAREFUL
+ * ---------------------------------------------------------------------------
+ * Three constraints, all researched, all load-bearing:
+ *
+ * 1. RESERVED TERMS HAVE STATUTORY TEETH. "Audit", "attestation", "assurance",
+ *    "examination" and "opinion" are reserved to licensed CPAs under state
+ *    accountancy acts (Uniform Accountancy Act and state adoptions) -- not
+ *    merely by AICPA convention. A document titled "Attestation" or carrying an
+ *    opinion block invites an unlicensed-practice problem. A document titled
+ *    "Security Control Evidence Report", describing itself as automated static
+ *    analysis, does not. This risk is almost entirely controlled by naming.
+ *
+ * 2. THE FTC HAS ALREADY PENALISED THE TOOL VENDOR, NOT JUST THE CUSTOMER.
+ *    January 2025: a $1M order against a marketer for deceptive claims that its
+ *    AI product could make websites compliant with accessibility guidelines.
+ *    The claim shape "our tool makes you compliant with <standard>" is the
+ *    penalised one. Separately, the FTC's Privacy Shield enforcement line
+ *    prohibits misrepresenting participation in "any privacy or data security
+ *    program sponsored by ... any other self-regulatory or standard-setting
+ *    organization" -- which is exactly what the AICPA is.
+ *
+ * 3. SOC 2 IS AN ATTESTATION, NOT A CERTIFICATION. There is no certifying body,
+ *    no certificate, and no pass/fail badge. Only a licensed CPA firm can issue
+ *    a report. SOC 2 reports are RESTRICTED-USE; SOC 3 is the general-use
+ *    report and is the intended artifact for a public page.
+ *
+ * Consequently this module NEVER emits, and must never be changed to emit:
+ *   - "compliant", "certified", "verified", "passed", "audit", "attestation"
+ *   - a framework-level green badge
+ *   - the AICPA SOC logo (its licence runs to the registered service
+ *     organisation, not to this tool)
+ *
+ * It emits PER-CRITERION EVIDENCE STATUS with a traceable source for each, plus
+ * an explicit statement of what is not covered. That is the differentiator:
+ * across every incumbent trust center surveyed, essentially nothing on the page
+ * is verifiable by the viewer. Here, every line traces to a file, a line number,
+ * a rule ID, a confidence level and a timestamp -- and the whole document
+ * carries a fingerprint the viewer can recompute.
+ *
+ * NO WRITES. This module returns strings. The host writes the file with the
+ * human in the loop, consistent with the rest of the server.
+ */
+
+import { createHash } from "node:crypto";
+import { SOC2_CONTROLS, coverageSummary, type Soc2Control } from "../catalog/soc2-controls.js";
+import type { Batch, Finding } from "../scanner/types.js";
+
+/**
+ * Per-criterion status.
+ *
+ * Deliberately NOT "pass"/"fail"/"compliant". "Pass" implies an assessor's
+ * judgment; these are observations about scanned files.
+ */
+export type EvidenceStatus =
+  /** Scanned, and no exception was found against this criterion. */
+  | "no-exceptions-found"
+  /** Scanned, and one or more findings are open. */
+  | "exceptions-found"
+  /** An IaC scan cannot evidence this criterion. Needs another source. */
+  | "not-evidenceable-by-scan"
+  /** Evidenceable in principle, but nothing in the scanned files covered it. */
+  | "not-covered-by-this-scan";
+
+export type TrustControlRow = {
+  id: string;
+  title: string;
+  group: string;
+  status: EvidenceStatus;
+  /** Plain-English reason for the status. Always populated. */
+  statusReason: string;
+  /** What evidence source this criterion actually needs. */
+  evidenceSource: string;
+  openFindings: number;
+  /** Traceability: where each finding came from. Empty unless exceptions found. */
+  traces: Array<{
+    findingId: string;
+    checkId: string;
+    filePath: string;
+    line: number | null;
+    severity: string;
+    mappingSource: string;
+    mappingConfidence: string;
+  }>;
+};
+
+export type TrustPageData = {
+  /** Deliberately not "Compliance Report". */
+  documentTitle: string;
+  /** A true sentence, safe to put in front of a prospect. Never a badge. */
+  statusLine: string;
+  generatedAt: string;
+  scan: {
+    batchId: string;
+    fingerprint: string;
+    scanner: string;
+    scannerVersion: string;
+    fileCount: number;
+    fingerprintTruncated: boolean;
+    recomputeCommand: string;
+    /** Files the scanner could not read. Never hidden -- see scanCoverage. */
+    parseErrors: string[];
+    /** Explicit in-source suppressions. Disclosed on the artifact. */
+    suppressions: Batch["suppressions"];
+    /** True when findings were capped; blocks any clean claim. */
+    findingsTruncated: boolean;
+    totalFindings: number;
+    /** False when parse errors, suppressions or an empty scan make "no exceptions" unclaimable. */
+    coverageUsable: boolean;
+  };
+  scope: {
+    framework: string;
+    criteriaTotal: number;
+    iacPrimary: number;
+    iacPartial: number;
+    notAutomatable: number;
+  };
+  summary: {
+    noExceptionsFound: number;
+    exceptionsFound: number;
+    notEvidenceableByScan: number;
+    notCoveredByThisScan: number;
+    totalOpenFindings: number;
+  };
+  controls: TrustControlRow[];
+  notCovered: string[];
+  disclaimers: string[];
+  /** SHA-256 over the canonicalised document, excluding this field. */
+  documentFingerprint: string;
+};
+
+// ---------------------------------------------------------------------------
+// Non-negotiable text
+// ---------------------------------------------------------------------------
+
+const DISCLAIMERS: string[] = [
+  "This document was generated by an automated static-analysis tool run locally. It is NOT an audit, examination, attestation, assurance engagement, or opinion, and it was not prepared or reviewed by a licensed CPA firm.",
+  "It does not constitute a SOC 2 report and is not a substitute for one. Only a licensed CPA firm can perform a SOC 2 examination and issue a report.",
+  "SOC 2 is an attestation, not a certification. There is no such thing as being 'SOC 2 certified'.",
+  "Findings below describe what infrastructure-as-code DECLARES. They are not evidence of deployed runtime state, which requires a separate check against live systems.",
+  "Statuses are observations about scanned files, not assessor judgments. 'No exceptions found' means this scan surfaced nothing against that criterion — it does not mean the criterion is satisfied.",
+  "SOC 2 and Trust Services Criteria are property of the AICPA. This tool is unaffiliated with the AICPA and references criteria by identifier only.",
+];
+
+const NOT_COVERED: string[] = [
+  "The optional Availability (A1.1-A1.3), Confidentiality (C1.1-C1.2), Processing Integrity (PI1.1-PI1.5) and Privacy (P1-P8) categories. This covers the Security category only.",
+  "Deployed runtime state. Everything here is derived from configuration files, not from live cloud APIs.",
+  "Any criterion whose evidence is a document, an HR record, or a human activity — that is the majority of the framework.",
+  "Operating effectiveness over time, which is what a SOC 2 Type II examination assesses. A scan is a point-in-time observation.",
+];
+
+/**
+ * Build the honest status line.
+ *
+ * Never a badge. Never "compliant". States exactly what was observed, over what
+ * scope, at what time — every element verifiable.
+ */
+function buildStatusLine(
+  summary: TrustPageData["summary"],
+  scope: TrustPageData["scope"],
+  when: string,
+  coverage: { usable: boolean; reason: string },
+): string {
+  const scanned = summary.noExceptionsFound + summary.exceptionsFound;
+  if (!coverage.usable) {
+    return (
+      `INCOMPLETE SCAN — this document cannot support a clean result. ${coverage.reason} ` +
+      `${summary.exceptionsFound} criteria have exceptions (${summary.totalOpenFindings} finding(s)); ` +
+      `${summary.notCoveredByThisScan} could not be assessed. Observed ${when}.`
+    );
+  }
+  return (
+    `Automated infrastructure-as-code scan of ${scope.criteriaTotal} SOC 2 Common Criteria (Security category). ` +
+    `${scanned} criteria were reachable by this scan: ${summary.noExceptionsFound} with no exceptions found, ` +
+    `${summary.exceptionsFound} with ${summary.totalOpenFindings} open finding(s). ` +
+    `${summary.notEvidenceableByScan} criteria cannot be evidenced by any infrastructure scan and require other evidence. ` +
+    `Observed ${when}.`
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Canonical JSON + fingerprint
+// ---------------------------------------------------------------------------
+
+/** Deterministic serialisation: sorted keys, so the hash is reproducible. */
+export function canonicalize(value: unknown): string {
+  const walk = (node: unknown): unknown => {
+    if (Array.isArray(node)) return node.map(walk);
+    if (node && typeof node === "object") {
+      const out: Record<string, unknown> = {};
+      for (const key of Object.keys(node as Record<string, unknown>).sort()) {
+        out[key] = walk((node as Record<string, unknown>)[key]);
+      }
+      return out;
+    }
+    return node;
+  };
+  return JSON.stringify(walk(value));
+}
+
+export function fingerprintDocument(data: Omit<TrustPageData, "documentFingerprint">): string {
+  return createHash("sha256").update(canonicalize(data)).digest("hex");
+}
+
+// ---------------------------------------------------------------------------
+// Build
+// ---------------------------------------------------------------------------
+
+/**
+ * Whether this scan is capable of supporting a "no exceptions found" claim at
+ * all.
+ *
+ * This is the guard against the worst failure this document can produce: a
+ * scan where NOTHING parsed yields zero findings, and without this check every
+ * reachable criterion would be reported as "no exceptions found" on an artifact
+ * handed to a prospect's security team.
+ *
+ * Conservative by design. ANY parse error downgrades EVERY criterion, because
+ * the file that failed to parse is exactly the file whose contents are unknown
+ * -- it could hold the exception. Claiming a clean result while admitting you
+ * could not read some of the input is not a claim anyone should make.
+ */
+function scanCoverage(batch: Batch): { usable: boolean; reason: string } {
+  if (batch.fileCount === 0) {
+    return {
+      usable: false,
+      reason:
+        "No infrastructure-as-code files were found or read in the scanned path, so this scan cannot support any statement about this criterion.",
+    };
+  }
+  if (batch.evaluatedResources === 0 && batch.evaluatedChecks === 0) {
+    return {
+      usable: false,
+      reason:
+        "Files were present but the scanner evaluated zero resources and ran zero checks, so nothing was " +
+        "actually assessed. That is what an unparseable or unsupported configuration looks like -- it is NOT " +
+        "a clean result.",
+    };
+  }
+  if (batch.findingsTruncated) {
+    return {
+      usable: false,
+      reason:
+        `The finding list was capped at ${batch.findings.length} of ${batch.totalFindings} results, so some ` +
+        `findings were dropped from this batch. A criterion showing no exceptions may simply have had its ` +
+        `findings truncated. Narrow the scan path and rerun before relying on this.`,
+    };
+  }
+  if (batch.suppressions.length > 0) {
+    return {
+      usable: false,
+      reason:
+        `${batch.suppressions.length} check(s) were explicitly suppressed in source (e.g. a ` +
+        `\`#checkov:skip\` comment). A suppressed check is an accepted risk, not an absent one, so ` +
+        `"no exceptions found" would misrepresent this scan. The suppressions are listed below.`,
+    };
+  }
+  if (batch.parseErrors.length > 0) {
+    return {
+      usable: false,
+      reason:
+        `The scanner could not parse ${batch.parseErrors.length} file(s), so the input was read only in part. ` +
+        `An unparsed file could contain an exception against this criterion, which means "no exceptions found" ` +
+        `cannot honestly be claimed. Resolve the parse errors and rescan.`,
+    };
+  }
+  return { usable: true, reason: "" };
+}
+
+function statusFor(
+  control: Soc2Control,
+  findings: Finding[],
+  coverage: { usable: boolean; reason: string },
+): { status: EvidenceStatus; reason: string } {
+  if (control.iac === "none") {
+    return {
+      status: "not-evidenceable-by-scan",
+      reason: control.iacNote,
+    };
+  }
+  if (findings.length > 0) {
+    return {
+      status: "exceptions-found",
+      reason: `${findings.length} finding(s) in the scanned files map to this criterion. Each is traceable below.`,
+    };
+  }
+  if (!coverage.usable) {
+    return { status: "not-covered-by-this-scan", reason: coverage.reason };
+  }
+  return {
+    status: "no-exceptions-found",
+    reason:
+      `The scan found no exceptions mapping to this criterion. Note this is the absence of a finding, ` +
+      `not proof the criterion is satisfied — the scan only sees what the rules cover. ${control.iacNote}`,
+  };
+}
+
+export function buildTrustPage(batch: Batch, now = new Date()): TrustPageData {
+  // Derived from the BATCH, not the wall clock. `generatedAt` is inside the
+  // hashed object and is embedded in `statusLine`, so using `now` meant
+  // preview_trust_page and render_trust_page produced different
+  // documentFingerprints for the same scan -- destroying the one property the
+  // document is sold on. The `now` parameter is retained only so callers can
+  // record when they rendered; it does not enter the hash.
+  const generatedAt = batch.createdAt;
+  void now;
+  const cov = coverageSummary();
+
+  const byControl = new Map<string, Finding[]>();
+  for (const finding of batch.findings) {
+    const id = finding.mapping.controlId;
+    if (!id) continue;
+    if (!byControl.has(id)) byControl.set(id, []);
+    byControl.get(id)!.push(finding);
+  }
+
+  const coverage = scanCoverage(batch);
+
+  const controls: TrustControlRow[] = SOC2_CONTROLS.map((control) => {
+    const findings = byControl.get(control.id) ?? [];
+    const { status, reason } = statusFor(control, findings, coverage);
+    return {
+      id: control.id,
+      title: control.title,
+      group: control.group,
+      status,
+      statusReason: reason,
+      evidenceSource: control.primarySource,
+      openFindings: findings.length,
+      traces: findings.map((f) => ({
+        findingId: f.id,
+        checkId: f.checkId,
+        filePath: f.filePath,
+        line: f.lineRange ? f.lineRange[0] : null,
+        severity: f.severity,
+        mappingSource: f.mapping.mappingSource,
+        mappingConfidence: f.mapping.confidence,
+      })),
+    };
+  });
+
+  const summary = {
+    noExceptionsFound: controls.filter((c) => c.status === "no-exceptions-found").length,
+    exceptionsFound: controls.filter((c) => c.status === "exceptions-found").length,
+    notEvidenceableByScan: controls.filter((c) => c.status === "not-evidenceable-by-scan").length,
+    notCoveredByThisScan: controls.filter((c) => c.status === "not-covered-by-this-scan").length,
+    totalOpenFindings: controls.reduce((acc, c) => acc + c.openFindings, 0),
+  };
+
+  const scope = {
+    framework: "SOC 2 Trust Services Criteria, Security category (Common Criteria)",
+    criteriaTotal: cov.total,
+    iacPrimary: cov.iac.primary,
+    iacPartial: cov.iac.partial,
+    notAutomatable: cov.notAutomatable,
+  };
+
+  const withoutFingerprint: Omit<TrustPageData, "documentFingerprint"> = {
+    documentTitle: "Security Control Evidence Report",
+    statusLine: buildStatusLine(summary, scope, generatedAt, coverage),
+    generatedAt,
+    scan: {
+      batchId: batch.batchId,
+      fingerprint: batch.fingerprint,
+      scanner: batch.scanner,
+      scannerVersion: batch.scannerVersion,
+      fileCount: batch.fileCount,
+      fingerprintTruncated: batch.fingerprintTruncated,
+      recomputeCommand: `npx @loxeai/mcp-server verify --root <path> --expect ${batch.fingerprint}`,
+      parseErrors: batch.parseErrors,
+      suppressions: batch.suppressions,
+      findingsTruncated: batch.findingsTruncated,
+      totalFindings: batch.totalFindings,
+      coverageUsable: coverage.usable,
+    },
+    scope,
+    summary,
+    controls,
+    notCovered: NOT_COVERED,
+    disclaimers: DISCLAIMERS,
+  };
+
+  return { ...withoutFingerprint, documentFingerprint: fingerprintDocument(withoutFingerprint) };
+}
+
+// ---------------------------------------------------------------------------
+// Renderers
+// ---------------------------------------------------------------------------
+
+const STATUS_LABEL: Record<EvidenceStatus, string> = {
+  "no-exceptions-found": "No exceptions found",
+  "exceptions-found": "Exceptions found",
+  "not-evidenceable-by-scan": "Not evidenceable by scan",
+  "not-covered-by-this-scan": "Not covered by this scan",
+};
+
+function esc(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+/**
+ * Self-contained HTML. No CDN, no webfont, no analytics, no external image, no
+ * script. A trust page that phones home would be flagged in exactly the
+ * security review it exists to serve.
+ */
+export function renderTrustPageHtml(data: TrustPageData): string {
+  const rows = data.controls
+    .map(
+      (c) => `      <tr class="s-${c.status}">
+        <td class="id">${esc(c.id)}</td>
+        <td>${esc(c.title)}<div class="grp">${esc(c.group)}</div></td>
+        <td class="st">${esc(STATUS_LABEL[c.status])}</td>
+        <td class="src">${esc(c.evidenceSource)}</td>
+        <td class="rsn">${esc(c.statusReason)}${
+          c.traces.length > 0
+            ? `<ul class="tr">${c.traces
+                .map(
+                  (t) =>
+                    `<li><code>${esc(t.checkId)}</code> &mdash; ${esc(t.filePath)}${
+                      t.line ? `:${t.line}` : ""
+                    } &middot; severity ${esc(t.severity)} &middot; mapping ${esc(t.mappingSource)}/${esc(
+                      t.mappingConfidence,
+                    )}</li>`,
+                )
+                .join("")}</ul>`
+            : ""
+        }</td>
+      </tr>`,
+    )
+    .join("\n");
+
+  return `<!DOCTYPE html>
+<meta charset="utf-8">
+<title>${esc(data.documentTitle)}</title>
+<style>
+:root{color-scheme:light dark}
+body{font:15px/1.55 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif;max-width:60rem;margin:2rem auto;padding:0 1rem}
+h1{font-size:1.5rem;margin:0 0 .25rem}
+.status{background:#f4f4f5;border-left:3px solid #71717a;padding:.75rem 1rem;margin:1rem 0;font-size:.95rem}
+.warn{border-left-color:#a16207;background:#fefce8}
+table{border-collapse:collapse;width:100%;font-size:.85rem;margin:1rem 0}
+th,td{border-bottom:1px solid #e4e4e7;padding:.5rem;text-align:left;vertical-align:top}
+th{font-weight:600;background:#fafafa}
+.id{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;white-space:nowrap}
+.grp{color:#71717a;font-size:.75rem}
+.st{white-space:nowrap;font-weight:500}
+.src{color:#52525b;font-size:.8rem;white-space:nowrap}
+.rsn{color:#3f3f46}
+.tr{margin:.4rem 0 0;padding-left:1rem;font-size:.78rem;color:#52525b}
+.s-exceptions-found .st{color:#b45309}
+.s-not-evidenceable-by-scan{opacity:.72}
+code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.85em}
+footer{margin-top:2rem;padding-top:1rem;border-top:1px solid #e4e4e7;color:#52525b;font-size:.8rem}
+ul.d{padding-left:1.1rem}
+@media(prefers-color-scheme:dark){
+body{background:#09090b;color:#e4e4e7}
+.status{background:#18181b;border-left-color:#52525b}
+.warn{background:#1c1917;border-left-color:#a16207}
+th{background:#18181b}th,td{border-color:#27272a}
+.rsn{color:#a1a1aa}.grp,.src,.tr,footer{color:#a1a1aa}
+}
+</style>
+<h1>${esc(data.documentTitle)}</h1>
+<p class="status">${esc(data.statusLine)}</p>
+
+<div class="status warn">
+<strong>What this document is.</strong>
+<ul class="d">${data.disclaimers.map((d) => `<li>${esc(d)}</li>`).join("")}</ul>
+</div>
+
+<h2>Scope</h2>
+<p>${esc(data.scope.framework)}. ${data.scope.criteriaTotal} criteria.
+An infrastructure-as-code scan is the primary evidence source for ${data.scope.iacPrimary},
+partially informs ${data.scope.iacPartial}, and cannot reach ${data.scope.notAutomatable}.</p>
+
+<h2>Criteria</h2>
+<table>
+<thead><tr><th>ID</th><th>Criterion</th><th>Status</th><th>Evidence source</th><th>Basis</th></tr></thead>
+<tbody>
+${rows}
+</tbody>
+</table>
+
+${
+    data.scan.parseErrors.length > 0 || !data.scan.coverageUsable
+      ? `<div class="status warn">
+<strong>Incomplete scan.</strong> This document cannot support a clean result.
+${
+  data.scan.suppressions.length > 0
+    ? `<p>${data.scan.suppressions.length} check(s) were explicitly suppressed in source. A suppressed check is an accepted risk, not an absent one:</p>
+<ul class="d">${data.scan.suppressions
+        .slice(0, 25)
+        .map(
+          (x) =>
+            `<li><code>${esc(x.checkId)}</code> on <code>${esc(x.resource)}</code> (${esc(x.filePath)}) — ${esc(x.reason)}</li>`,
+        )
+        .join("")}</ul>`
+    : ""
+}
+${
+  data.scan.parseErrors.length > 0
+    ? `The scanner could not parse ${data.scan.parseErrors.length} file(s):
+<ul class="d">${data.scan.parseErrors.slice(0, 25).map((f) => `<li><code>${esc(f)}</code></li>`).join("")}</ul>
+${data.scan.parseErrors.length > 25 ? `<p>...and ${data.scan.parseErrors.length - 25} more.</p>` : ""}
+<p>An unparsed file could contain an exception, so no criterion below is reported as having no exceptions. Resolve the parse errors and rescan.</p>`
+    : `<p>No infrastructure-as-code files were found or read in the scanned path.</p>`
+}
+</div>`
+      : ""
+  }
+
+<h2>Not covered</h2>
+<ul class="d">${data.notCovered.map((n) => `<li>${esc(n)}</li>`).join("")}</ul>
+
+<footer>
+<p><strong>Verify this document.</strong> Input fingerprint
+<code>${esc(data.scan.fingerprint)}</code> is a SHA-256 over the scanned files.
+Two scans with the same fingerprint saw identical input. Recompute with:<br>
+<code>${esc(data.scan.recomputeCommand)}</code></p>
+<p>Document fingerprint <code>${esc(data.documentFingerprint)}</code> &middot;
+Scanner ${esc(data.scan.scanner)} ${esc(data.scan.scannerVersion)} &middot;
+${data.scan.fileCount} file(s)${data.scan.fingerprintTruncated ? " (truncated — covers a subset)" : ""} &middot;
+Generated ${esc(data.generatedAt)}</p>
+</footer>
+`;
+}
+
+/** Markdown, for a README or a questionnaire response. */
+export function renderTrustPageMarkdown(data: TrustPageData): string {
+  const lines: string[] = [
+    `# ${data.documentTitle}`,
+    "",
+    data.statusLine,
+    "",
+    "## What this document is",
+    ...data.disclaimers.map((d) => `- ${d}`),
+    "",
+    "## Scope",
+    `${data.scope.framework}. ${data.scope.criteriaTotal} criteria. An infrastructure-as-code scan is the primary evidence source for ${data.scope.iacPrimary}, partially informs ${data.scope.iacPartial}, and cannot reach ${data.scope.notAutomatable}.`,
+    "",
+    ...(data.scan.parseErrors.length > 0 || !data.scan.coverageUsable
+      ? [
+          "## Incomplete scan",
+          "",
+          ...(data.scan.suppressions.length > 0
+            ? [
+                `${data.scan.suppressions.length} check(s) were explicitly suppressed in source. A suppressed check is an accepted risk, not an absent one:`,
+                "",
+                ...data.scan.suppressions
+                  .slice(0, 25)
+                  .map((x) => `- \`${x.checkId}\` on \`${x.resource}\` (${x.filePath}) — ${x.reason}`),
+                "",
+              ]
+            : []),
+          data.scan.parseErrors.length > 0
+            ? `The scanner could not parse ${data.scan.parseErrors.length} file(s). An unparsed file could contain an exception, so no criterion below is reported as having no exceptions. Resolve and rescan.`
+            : "No infrastructure-as-code files were found or read in the scanned path.",
+          "",
+          ...data.scan.parseErrors.slice(0, 25).map((f) => `- \`${f}\``),
+          ...(data.scan.parseErrors.length > 25 ? [`- ...and ${data.scan.parseErrors.length - 25} more`] : []),
+          "",
+        ]
+      : []),
+    "## Criteria",
+    "",
+    "| ID | Criterion | Status | Evidence source | Open findings |",
+    "|---|---|---|---|---|",
+    ...data.controls.map(
+      (c) => `| ${c.id} | ${c.title} | ${STATUS_LABEL[c.status]} | ${c.evidenceSource} | ${c.openFindings} |`,
+    ),
+    "",
+    // Traceability, promised by the tool description and previously missing
+    // from this renderer entirely.
+    ...(data.controls.some((c) => c.traces.length > 0)
+      ? [
+          "## Traceability",
+          "",
+          ...data.controls
+            .filter((c) => c.traces.length > 0)
+            .flatMap((c) => [
+              `### ${c.id} — ${c.title}`,
+              "",
+              ...c.traces.map(
+                (t) =>
+                  `- \`${t.checkId}\` — ${t.filePath}${t.line ? `:${t.line}` : ""} · severity ${t.severity} · mapping ${t.mappingSource}/${t.mappingConfidence}`,
+              ),
+              "",
+            ]),
+        ]
+      : []),
+    "## Not covered",
+    ...data.notCovered.map((n) => `- ${n}`),
+    "",
+    "## Verification",
+    `- Input fingerprint: \`${data.scan.fingerprint}\` (SHA-256 over scanned files)`,
+    `- Document fingerprint: \`${data.documentFingerprint}\``,
+    `- Recompute: \`${data.scan.recomputeCommand}\``,
+    `- Scanner: ${data.scan.scanner} ${data.scan.scannerVersion}, ${data.scan.fileCount} file(s)`,
+    `- Generated: ${data.generatedAt}`,
+  ];
+  return lines.join("\n");
+}
+
+/** Wording that must never appear in generated output. Enforced by test. */
+export const FORBIDDEN_CLAIM_WORDS = [
+  "soc 2 certified",
+  "soc2 certified",
+  "soc 2 compliant",
+  "soc2 compliant",
+  "certified",
+  "attestation",
+  "attested",
+  "audited by",
+  "our opinion",
+  "fairly presented",
+  "operating effectively",
+];
